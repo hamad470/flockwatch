@@ -1,0 +1,144 @@
+"""FlockWatch dashboard: one view per stakeholder.  Run:  streamlit run app/streamlit_app.py"""
+import io, json, sqlite3, sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from flockwatch.config import DB_PATH, MODELS, FIGURES, SAMPLES, CLASSES  # noqa: E402
+from flockwatch.features import to_float, resample, fix_length, log_mel  # noqa: E402
+from scipy.io import wavfile  # noqa: E402
+
+st.set_page_config(page_title="FlockWatch", page_icon="🐔", layout="wide")
+COLOURS = {"Red": "#C0392B", "Amber": "#E67E22", "Green": "#27AE60", "No data": "#95A5A6"}
+
+
+@st.cache_data
+def load(table: str) -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql(f"SELECT * FROM {table}", con)
+
+
+@st.cache_resource
+def predictor():
+    from flockwatch.predict import Predictor
+    return Predictor()
+
+
+houses, daily, cards, rec = load("houses"), load("daily_index"), load("record_cards"), load("recordings")
+metrics = json.loads((MODELS / "metrics.json").read_text())
+lead = pd.read_csv(ROOT / "data" / "processed" / "lead_time_evaluation.csv")
+
+st.title("🐔 FlockWatch: acoustic early warning of ill health in poultry flocks")
+st.caption("Portfolio project by Hamad Ur Rehman. All audio and farm data are synthetic; see the README for how to retrain on the public datasets.")
+tab1, tab2, tab3, tab4 = st.tabs(["Farm overview", "Early warning (vet / research)", "Try the sound model", "Data quality & governance"])
+
+with tab1:
+    farm = st.radio("Farm", sorted(houses.farm.unique()), horizontal=True)
+    hs = houses[houses.farm == farm].house_id.tolist()
+    day = st.slider("Day of crop", 1, int(cards.age_days.max()) + 1, int(cards.age_days.max()) + 1) - 1
+    cols = st.columns(len(hs))
+    for col, h in zip(cols, hs):
+        c = cards[(cards.house_id == h) & (cards.age_days <= day)]
+        d = daily[(daily.house_id == h) & (daily.date <= c.date.max())]
+        level = d.alert_level.iloc[-1] if len(d) else "No data"
+        placed = int(houses.set_index("house_id").capacity_birds[h] * 0.98)
+        with col:
+            st.markdown(f"### {h} <span style='color:{COLOURS[level]}'>● {level}</span>", unsafe_allow_html=True)
+            st.metric("Cumulative mortality", f"{(c.mortality.sum() + c.culls.sum()) / placed:.2%}")
+            st.metric("Average weight (g)", f"{int(c.avg_weight_g.iloc[-1]):,}")
+            st.metric("Birds alive", f"{int(c.birds_alive.iloc[-1]):,}")
+    st.subheader("Daily record cards")
+    st.dataframe(cards[cards.house_id.isin(hs) & (cards.age_days <= day)].sort_values(["date", "house_id"], ascending=[False, True]),
+                 hide_index=True, use_container_width=True)
+
+with tab2:
+    h = st.selectbox("House", houses.house_id, index=2)
+    d = daily[daily.house_id == h].copy()
+    c = cards[cards.house_id == h]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_bar(x=c.date, y=c.mortality, name="Daily mortality", marker_color="#BDC3C7", secondary_y=True)
+    fig.add_scatter(x=d.date, y=d.sound_index, name="Respiratory sound index", line=dict(color="#2C3E50", width=3))
+    fig.add_scatter(x=d.date, y=d.baseline, name="Baseline (recent normal days)", line=dict(color="#7F8C8D", dash="dash"))
+    al = d[d.alert_level.isin(["Amber", "Red"])]
+    fig.add_scatter(x=al.date, y=al.sound_index, mode="markers", name="Alert",
+                    marker=dict(size=12, color=[COLOURS[l] for l in al.alert_level], symbol="diamond"))
+    fig.update_yaxes(title_text="Sound index (0-1)", secondary_y=False)
+    fig.update_yaxes(title_text="Deaths per day", secondary_y=True)
+    fig.update_layout(height=420, legend=dict(orientation="h", y=-0.2), margin=dict(t=20))
+    st.plotly_chart(fig, use_container_width=True)
+    row = lead[lead.house_id == h].iloc[0]
+    if pd.notna(row.lead_time_days):
+        st.success(f"First alert {row.first_alert}; mortality spike {row.first_mortality_spike}: **{int(row.lead_time_days)} day(s) of early warning**.")
+    else:
+        st.info("No mortality spike in this house during the crop.")
+    st.subheader("Outbreak detection across all houses")
+    st.dataframe(lead, hide_index=True)
+    with st.expander("How alerts work"):
+        st.markdown("""
+* Each hourly 5-second clip is scored by a CNN (healthy / unhealthy / noise). Clips classed as noise are ignored.
+* **Sound index** = the day's average probability that bird sounds are respiratory-type (coughs, sneezes, rales).
+* Each house is compared with **its own recent normal days** (median and MAD). Days already in alert are excluded from the baseline, so an outbreak can't hide itself.
+* **Amber**: index ≥ baseline + 3 robust SDs and ≥ 0.20. **Red**: Amber plus index ≥ 0.40 or water intake down ≥ 8% (an independent signal).
+""")
+
+with tab3:
+    st.write("Upload a WAV recording from a poultry house, or try one of the samples.")
+    up = st.file_uploader("WAV file", type=["wav"])
+    sample = st.selectbox("…or choose a sample", sorted(p.name for p in SAMPLES.glob("*.wav")))
+    raw = up.read() if up else (SAMPLES / sample).read_bytes()
+    st.audio(raw, format="audio/wav")
+    sr, x = wavfile.read(io.BytesIO(raw))
+    x = to_float(x)
+    res = predictor().predict_long(x, sr)
+    if len(res) == 1:
+        r = res[0]
+        st.metric("Prediction", r["label"].title(), f"{max(r[c] for c in CLASSES):.0%} confidence", delta_color="off")
+        st.bar_chart(pd.Series({c: r[c] for c in CLASSES}, name="probability"))
+    else:
+        tl = pd.DataFrame(res)
+        st.write(f"Long recording: {len(tl)} overlapping 5-second windows")
+        st.line_chart(tl.set_index("start_s")[CLASSES])
+    spec = log_mel(fix_length(resample(x, sr)))
+    fig, ax = plt.subplots(figsize=(8, 2.6))
+    ax.imshow(spec, origin="lower", aspect="auto", cmap="magma")
+    ax.set_title("Log-mel spectrogram (first 5 s), the model's input"); ax.set_xlabel("frames"); ax.set_ylabel("mel bands")
+    st.pyplot(fig)
+
+with tab4:
+    c1, c2, c3 = st.columns(3)
+    acc = (rec.status == "accepted").mean()
+    c1.metric("Clips received", f"{len(rec):,}")
+    c2.metric("Accepted after quality checks", f"{acc:.1%}")
+    expected = len(cards) * 24
+    c3.metric("Sensor coverage (clips received / expected)", f"{len(rec) / expected:.1%}")
+    q = rec[rec.status == "quarantined"]
+    cause = (q.reason.str.split(";").str[0]
+             .str.replace(r"clipping [\d.]+%", "clipping", regex=True)
+             .str.replace(r"duration [\d.]+s", "duration", regex=True)
+             .str.replace(r"sample rate \d+ Hz", "sample rate", regex=True))
+    q2 = cause.value_counts().rename_axis("reason").rename("clips").reset_index()
+    st.subheader("Why clips were quarantined")
+    st.dataframe(q2.sort_values("clips", ascending=False), hide_index=True)
+    rec["date"] = pd.to_datetime(rec.recorded_at).dt.date.astype(str)
+    cov = rec.groupby(["house_id", "date"]).size().unstack(0).fillna(0)
+    st.subheader("Clips per house per day (24 expected): gaps show device outages")
+    st.line_chart(cov)
+    st.subheader("Model card summary")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Test accuracy", f"{metrics['test_accuracy']:.1%}")
+    m2.metric("Macro F1", f"{metrics['test_macro_f1']:.2f}")
+    m3.metric("Unhealthy recall", f"{metrics['unhealthy_recall']:.1%}")
+    m4.metric("Unhealthy precision", f"{metrics['unhealthy_precision']:.1%}")
+    st.caption(f"Trained on {metrics['data_source']} data: {metrics['n_clips']} clips from {metrics['n_sessions']} recording sessions, split by session to prevent leakage.")
+    if (FIGURES / "confusion_matrix.png").exists():
+        st.image(str(FIGURES / "confusion_matrix.png"), width=380)
+    st.subheader("Audit log")
+    st.dataframe(load("audit_log"), hide_index=True, use_container_width=True)
