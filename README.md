@@ -4,7 +4,7 @@
 
 FlockWatch listens to poultry houses. A convolutional neural network classifies 5-second microphone clips as **healthy**, **unhealthy** (coughs, sneezes, rales) or **noise**. A daily **respiratory sound index** per house then raises an alert when the flock starts to sound sick, **before mortality rises**. Everything around the model is built too: quality-checked data collection, auditable storage, and reports for farm managers, vets and researchers.
 
-🔗 **Live demo:** _add your Streamlit / Hugging Face link here_
+🔗 **Live demo: [flockwatch.streamlit.app](https://flockwatch.streamlit.app/)**
 
 ![Early warning for house H3](reports/figures/early_warning_H3.png)
 
